@@ -2,6 +2,8 @@ import base64
 import hashlib
 import json
 import os
+import shutil
+
 import requests
 
 from urllib.parse import urlparse
@@ -10,14 +12,13 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from mapclientplugins.retrieveportaldatastep.ui_retrieveportaldatawidget import Ui_RetrievePortalDataWidget
 from mapclientplugins.retrieveportaldatastep.definitions import DEFAULT_VALUE, DEFAULT_HEADERS
-from mapclientplugins.retrieveportaldatastep.scicrunch_requests import create_filter_request, form_scicrunch_match_request
+from mapclientplugins.retrieveportaldatastep.scicrunch_requests import create_filter_request, \
+    form_scicrunch_match_request
 from mapclientplugins.retrieveportaldatastep.downloadprogressdialog import DownloadProgressDialog
 
-from sparc.client.services.pennsieve import PennsieveService
-from sparc.client.services.metadata import MetadataService
-from sparc.client.zinchelper import ZincHelper
-
 from mapclient.settings.general import get_data_directory
+
+POSSIBLE_DOI_SUFFIXES = ["DOI:", "https://doi.org/", "http://dx.doi.org/"]
 
 SPECIES = [
     "Cat",
@@ -104,8 +105,7 @@ def _do_scicrunch_request(req):
 
 
 def _standardise_doi_form(text):
-    POSSIBLE_SUFFIXES = ["DOI:", "https://doi.org/", "http://dx.doi.org/"]
-    for suffix in POSSIBLE_SUFFIXES:
+    for suffix in POSSIBLE_DOI_SUFFIXES:
         if text.startswith(suffix):
             text = text.replace(suffix, "")
             text = text.strip()
@@ -118,13 +118,14 @@ def _create_search_result(obj, result):
         "name": obj["name"],
         "datasetId": result["_source"]["object_id"],
         "datasetVersion": result["_source"]["pennsieve"]["version"]["identifier"],
-        "mimetype": obj["additional_mimetype"]["name"] if obj["additional_mimetype"]["name"] else obj["mimetype"]["name"],
+        "mimetype": obj["additional_mimetype"]["name"] if obj["additional_mimetype"]["name"] else obj["mimetype"][
+            "name"],
         "datasetPath": obj["dataset"]["path"],
         "uri": "",
     }
 
 
-def _return_scicruncth_search_result(search_text, search_type, facets):
+def _return_scicrunch_search_result(search_text, search_type, facets):
     result_size = 100
     target_field_parts = []
     req = {}
@@ -152,7 +153,7 @@ def _return_scicruncth_search_result(search_text, search_type, facets):
 
 
 def _scicrunch_search(search_text, search_type, facets=None):
-    post_result, result_size, target_field_parts = _return_scicruncth_search_result(search_text, search_type, facets)
+    post_result, result_size, target_field_parts = _return_scicrunch_search_result(search_text, search_type, facets)
     search_result = []
     if "hits" in post_result and post_result["hits"]["total"] > 0:
         for hit_index in range(min(result_size, post_result["hits"]["total"])):
@@ -177,8 +178,11 @@ def _scicrunch_search(search_text, search_type, facets=None):
 
 
 def _determine_dataset_path(uri):
-    parsed_object = urlparse(uri)
-    return parsed_object.path.split("files/")[1]
+    if uri:
+        parsed_object = urlparse(uri)
+        return parsed_object.path.split("files/")[1]
+
+    return ''
 
 
 def get_sha256(file_path):
@@ -210,11 +214,10 @@ class DownloadSignals(QtCore.QObject):
 
 class FileDownloadTask(QtCore.QRunnable):
 
-    def __init__(self, item, output_dir, pennsieve_service):
+    def __init__(self, item, output_dir):
         super().__init__()
         self._item = item
         self._output_dir = output_dir
-        self._pennsieve_service = pennsieve_service
         self.signals = DownloadSignals()
 
     def run(self):
@@ -223,15 +226,24 @@ class FileDownloadTask(QtCore.QRunnable):
         safe_makedirs(local_dir)
 
         uri = _form_pennsieve_download_file_endpoint(self._item)
-        params = {'path': self._item['datasetPath']} if self._item['datasetPath'].startswith('files/') else {'path': f'files/{self._item["datasetPath"]}'}
-        response = self._pennsieve_service.get(uri, params=params)
+        params = {'path': self._item['datasetPath']} if self._item['datasetPath'].startswith('files/') else {
+            'path': f'files/{self._item["datasetPath"]}'}
+        response = requests.get(uri, params=params, stream=True)
 
-        if response.get('sha256', '') != get_sha256(local_destination):
-            self._pennsieve_service.download_file({
-                'datasetId': self._item['datasetId'],
-                'datasetVersion': self._item['datasetVersion'],
-                'uri': f'/////{response.get("path")}'
-            }, local_destination)
+        json_data = response.json()
+        if json_data.get('sha256', '') != get_sha256(local_destination):
+            req = {
+                "data": {
+                    "paths": [params['path']],
+                    "datasetId": self._item['datasetId'],
+                    "version": self._item['datasetVersion'],
+                }
+            }
+            discover_zipit_url = "https://api.pennsieve.io/zipit/discover"
+            headers = {"content-type": "application/json"}
+            response = requests.post(discover_zipit_url, json=req, headers=headers, stream=True)
+            with open(local_destination, 'wb') as f:
+                shutil.copyfileobj(response.raw, f)
 
         # Emit signal when done
         self.signals.finished.emit(local_destination)
@@ -254,10 +266,6 @@ class RetrievePortalDataWidget(QtWidgets.QWidget):
 
         _initialise_search_bank()
 
-        self._pennsieve_service = PennsieveService(connect=False)
-        self._scicrunch_service = MetadataService()
-        self._zinc = ZincHelper()
-
         self._completer = QtWidgets.QCompleter()
         self._completer.setCaseSensitivity(QtCore.Qt.CaseSensitivity.CaseInsensitive)
         self._completer.setFilterMode(QtCore.Qt.MatchFlag.MatchContains)
@@ -269,13 +277,13 @@ class RetrievePortalDataWidget(QtWidgets.QWidget):
         self._dataset_id_completer.setCaseSensitivity(QtCore.Qt.CaseSensitivity.CaseInsensitive)
         self._dataset_id_completer.setFilterMode(QtCore.Qt.MatchFlag.MatchContains)
 
-        fileBrowserModel = QtWidgets.QFileSystemModel()
-        fileBrowserModel.setRootPath(QtCore.QDir.rootPath())
-        self._ui.treeViewFileBrowser.setModel(fileBrowserModel)
-        self._ui.treeViewFileBrowser.setRootIndex(fileBrowserModel.index(self._output_dir))
+        file_browser_model = QtWidgets.QFileSystemModel()
+        file_browser_model.setRootPath(QtCore.QDir.rootPath())
+        self._ui.treeViewFileBrowser.setModel(file_browser_model)
+        self._ui.treeViewFileBrowser.setRootIndex(file_browser_model.index(self._output_dir))
 
-        listModel = QtCore.QStringListModel(output_files)
-        self._ui.listViewProvidedFiles.setModel(listModel)
+        list_model = QtCore.QStringListModel(output_files)
+        self._ui.listViewProvidedFiles.setModel(list_model)
 
         self._make_connections()
         self._update_ui()
@@ -322,22 +330,24 @@ class RetrievePortalDataWidget(QtWidgets.QWidget):
     def _set_table(self, file_list):
         self._model = QtGui.QStandardItemModel(0, 4)
         self._model.setHorizontalHeaderLabels(['Filename', 'Dataset ID', 'Dataset Version', 'Mimetype', 'Dataset Path'])
-        for row in range(len(file_list)):
-            item = QtGui.QStandardItem(f"{file_list[row]['name']}")
+        for row, file_info in enumerate(file_list):
+            item = QtGui.QStandardItem(f"{file_info['name']}")
+            item.setData(file_info, QtCore.Qt.ItemDataRole.UserRole)
             self._model.setItem(row, 0, item)
-            item = QtGui.QStandardItem(f"{file_list[row]['datasetId']}")
+            item = QtGui.QStandardItem(f"{file_info['datasetId']}")
             self._model.setItem(row, 1, item)
-            item = QtGui.QStandardItem(f"{file_list[row]['datasetVersion']}")
+            item = QtGui.QStandardItem(f"{file_info['datasetVersion']}")
             self._model.setItem(row, 2, item)
-            mimetype_approx = file_list[row]['mimetype'] if file_list[row].get('mimetype', '') else file_list[row].get('fileType', '')
+            mimetype_approx = file_info.get('mimetype', file_info.get('fileType', ''))
             item = QtGui.QStandardItem(f"{mimetype_approx}")
             self._model.setItem(row, 3, item)
-            dataset_path = file_list[row]['datasetPath'] if file_list[row].get('datasetPath', '') else _determine_dataset_path(file_list[row]['uri'])
+            dataset_path = file_info.get('datasetPath', _determine_dataset_path(file_info['uri']))
             item = QtGui.QStandardItem(f"{dataset_path}")
             self._model.setItem(row, 4, item)
 
         self._ui.tableViewSearchResult.setModel(self._model)
-        self._ui.tableViewSearchResult.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self._ui.tableViewSearchResult.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self._ui.tableViewSearchResult.horizontalHeader().setStretchLastSection(True)
         self._selection_model = self._ui.tableViewSearchResult.selectionModel()
         self._selection_model.selectionChanged.connect(self._update_ui)
@@ -374,13 +384,23 @@ class RetrievePortalDataWidget(QtWidgets.QWidget):
         search_by = self._ui.comboBoxSearchBy.currentText()
         dataset_id = self._ui.lineEditDatasetID.text()
 
-        # Use sparc.client to retrieve files
+        # Retrieve files
         if search_by == "filename":
-            self._list_files = self._pennsieve_service.list_files(
-                limit=100,
-                query=search_text,
-                dataset_id=dataset_id,
-            )
+            discover_search_files_url = "https://api.pennsieve.io/discover/search/files"
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json; charset=utf-8",
+            }
+            params = {
+                "limit": 100,
+                "offset": 0,
+                "query": search_text,
+                "datasetId": dataset_id,
+            }
+            response = requests.get(discover_search_files_url, headers=headers, params=params)
+            if response.status_code == 200:
+                json_data = response.json()
+                self._list_files = json_data['files']
         elif search_by == "mimetype":
             facets = {
                 'species': _extract_facets(self._ui.toolButtonFilterSpecies),
@@ -464,14 +484,12 @@ class RetrievePortalDataWidget(QtWidgets.QWidget):
         self._save_search()
 
     def _file_exists(self, filename):
-        return filename in [f for f in os.listdir(self._output_dir) if os.path.isfile(os.path.join(self._output_dir, f))]
+        return filename in [f for f in os.listdir(self._output_dir) if
+                            os.path.isfile(os.path.join(self._output_dir, f))]
 
     def _file_has_updates(self, filename):
-        return filename in [f for f in os.listdir(self._output_dir) if os.path.isfile(os.path.join(self._output_dir, f))]
-
-    def _get_pennsieve_uri_suffix(self, dataset_id):
-        result = self._pennsieve_service.list_files(dataset_id=dataset_id, query='manifest', file_type='json')
-        return result[0]["uri"].replace("manifest.json", "")
+        return filename in [f for f in os.listdir(self._output_dir) if
+                            os.path.isfile(os.path.join(self._output_dir, f))]
 
     def _download_button_clicked(self):
         indexes = self._ui.tableViewSearchResult.selectionModel().selectedRows()
@@ -481,11 +499,12 @@ class RetrievePortalDataWidget(QtWidgets.QWidget):
         download_dialog.show()
 
         for index in indexes:
-            item = self._list_files[index.row()]
-            if item.get('datasetPath', '') == '':
-                item['datasetPath'] = _determine_dataset_path(item['uri'])
+            model_index = index.siblingAtColumn(0)
+            item_data = model_index.data(QtCore.Qt.ItemDataRole.UserRole)
+            if item_data.get('datasetPath') is None:
+                item_data['datasetPath'] = _determine_dataset_path(item_data['uri'])
 
-            task = FileDownloadTask(item, self._output_dir, self._pennsieve_service)
+            task = FileDownloadTask(item_data, self._output_dir)
             task.signals.finished.connect(download_dialog.update_progress)
             thread_pool.start(task)
 
@@ -493,7 +512,7 @@ class RetrievePortalDataWidget(QtWidgets.QWidget):
         indexes = self._ui.tableViewSearchResult.selectionModel().selectedRows()
         for index in indexes:
             output_name = os.path.join(self._output_dir, self._list_files[index.row()]['name'])
-            self._zinc.get_mbf_vtk(self._list_files[index.row()]['datasetId'], output_name)
+            print('DISABLED: Exporting ' + output_name)
 
     def get_output_files(self):
         list_model = self._ui.listViewProvidedFiles.model()
