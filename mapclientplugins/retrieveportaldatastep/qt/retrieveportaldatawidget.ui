@@ -234,7 +234,7 @@
          <set>QAbstractItemView::EditTrigger::NoEditTriggers</set>
         </property>
         <property name="selectionMode">
-         <enum>QAbstractItemView::SelectionMode::MultiSelection</enum>
+         <enum>QAbstractItemView::SelectionMode::ExtendedSelection</enum>
         </property>
         <property name="selectionBehavior">
          <enum>QAbstractItemView::SelectionBehavior::SelectRows</enum>

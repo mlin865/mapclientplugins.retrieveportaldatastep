@@ -221,32 +221,35 @@ class FileDownloadTask(QtCore.QRunnable):
         self.signals = DownloadSignals()
 
     def run(self):
-        local_destination = _form_local_destination(self._output_dir, self._item)
-        local_dir = os.path.dirname(local_destination)
-        safe_makedirs(local_dir)
+        local_destination = "error"
+        try:
+            local_destination = _form_local_destination(self._output_dir, self._item)
+            local_dir = os.path.dirname(local_destination)
+            safe_makedirs(local_dir)
 
-        uri = _form_pennsieve_download_file_endpoint(self._item)
-        params = {'path': self._item['datasetPath']} if self._item['datasetPath'].startswith('files/') else {
-            'path': f'files/{self._item["datasetPath"]}'}
-        response = requests.get(uri, params=params, stream=True)
+            uri = _form_pennsieve_download_file_endpoint(self._item)
+            params = {'path': self._item['datasetPath']} if self._item['datasetPath'].startswith('files/') else {
+                'path': f'files/{self._item["datasetPath"]}'}
+            response = requests.get(uri, params=params, stream=True)
 
-        json_data = response.json()
-        if json_data.get('sha256', '') != get_sha256(local_destination):
-            req = {
-                "data": {
-                    "paths": [params['path']],
-                    "datasetId": self._item['datasetId'],
-                    "version": self._item['datasetVersion'],
+            json_data = response.json()
+            if json_data.get('sha256', '') != get_sha256(local_destination):
+                req = {
+                    "data": {
+                        "paths": [params['path']],
+                        "datasetId": self._item['datasetId'],
+                        "version": self._item['datasetVersion'],
+                    }
                 }
-            }
-            discover_zipit_url = "https://api.pennsieve.io/zipit/discover"
-            headers = {"content-type": "application/json"}
-            response = requests.post(discover_zipit_url, json=req, headers=headers, stream=True)
-            with open(local_destination, 'wb') as f:
-                shutil.copyfileobj(response.raw, f)
+                discover_zipit_url = "https://api.pennsieve.io/zipit/discover"
+                headers = {"content-type": "application/json"}
+                response = requests.post(discover_zipit_url, json=req, headers=headers, stream=True)
+                with open(local_destination, 'wb') as f:
+                    shutil.copyfileobj(response.raw, f)
 
-        # Emit signal when done
-        self.signals.finished.emit(local_destination)
+        finally:
+            # Emit signal when done
+            self.signals.finished.emit(local_destination)
 
 
 class RetrievePortalDataWidget(QtWidgets.QWidget):
